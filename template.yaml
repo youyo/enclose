@@ -1,0 +1,255 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  Stage:
+    Type: String
+    Default: develop
+  DynamodbTableName:
+    Type: String
+    Default: enclose
+
+Globals:
+  Function:
+    Runtime: go1.x
+    Tracing: Active
+    Timeout: 60
+    MemorySize: 256
+    Environment:
+      Variables:
+        DYNAMODB_TABLE_NAME: !Ref DynamodbTableName
+        LetsEncryptURL: https://acme-staging.api.letsencrypt.org/directory
+        # LetsEncryptURL: https://acme-v01.api.letsencrypt.org/directory
+  Api:
+    Cors:
+      AllowMethods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+      AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+      AllowOrigin: "'*'"
+
+Resources:
+  ApiGatewayCloudWatchLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchLogsRole.Arn
+
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Stage
+      MethodSettings:
+        - DataTraceEnabled: true
+          LoggingLevel: ERROR
+          ResourcePath: '/*'
+          HttpMethod: '*'
+          MetricsEnabled: true
+      DefinitionBody:
+        Fn::Transform:
+          Name: AWS::Include
+          Parameters:
+            Location: swagger.yaml
+    DependsOn:
+      - ApiGatewayAccount
+
+  FuncPostCertificateRequest:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: artifacts/
+      Handler: post_certificate_request
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamodbTableName
+      Events:
+        PostCertificateRequest:
+          Type: Api
+          Properties:
+            Path: /
+            Method: post
+            RestApiId: !Ref ApiGateway
+
+  FuncGetDomainStatus:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: artifacts/
+      Handler: get_domain_status
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamodbTableName
+      Events:
+        GetDomainStatus:
+          Type: Api
+          Properties:
+            Path: /{domain}
+            Method: get
+            RestApiId: !Ref ApiGateway
+
+  FuncHandlerStreams:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: artifacts/
+      Handler: handler_streams
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamodbTableName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - states:StartExecution
+              Resource:
+                - !Ref StepFunctions
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref StepFunctions
+      Events:
+        HandlerStreams:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt DynamodbTable.StreamArn
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 1
+
+  FuncCheckTextRecord:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: artifacts/
+      Handler: check_text_record
+
+  FuncExecuteAuthorization:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: artifacts/
+      Handler: execute_authorization
+
+  FuncCreateCert:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: artifacts/
+      Handler: create_cert
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamodbTableName
+
+  DynamodbTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref DynamodbTableName
+      AttributeDefinitions:
+        - AttributeName: Domain
+          AttributeType: S
+        - AttributeName: RequestId
+          AttributeType: S
+#        - AttributeName: Timestamp
+#          AttributeType: S
+      KeySchema:
+        - AttributeName: Domain
+          KeyType: HASH
+#        - AttributeName: Timestamp
+#          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: RequestId
+          KeySchema:
+            - AttributeName: RequestId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: false
+      TimeToLiveSpecification:
+        AttributeName: TTL
+        Enabled: true
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+
+  StepFunctions:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "A Hello World",
+          "StartAt": "Wait",
+          "States": {
+            "Wait": {
+              "Type": "Wait",
+              "Seconds": 10,
+              "Next": "CheckTextRecord"
+            },
+            "CheckTextRecord": {
+              "Type": "Task",
+              "Resource": "${FuncCheckTextRecord.Arn}",
+              "Next": "Choice"
+            },
+            "Choice": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.status",
+                  "StringEquals": "TextRecordMatched",
+                  "Next": "ExecuteAuthorization"
+                },
+                {
+                  "Variable": "$.status",
+                  "StringEquals": "WaitDnsAuthorization",
+                  "Next": "Wait"
+                }
+              ],
+              "Default": "Wait"
+            },
+            "ExecuteAuthorization": {
+              "Type": "Task",
+              "Resource": "${FuncExecuteAuthorization.Arn}",
+              "Next": "CreateCert"
+            },
+            "CreateCert": {
+              "Type": "Task",
+              "Resource": "${FuncCreateCert.Arn}",
+              "End": true
+            }
+          }
+        }
+    DependsOn:
+      - FuncCheckTextRecord
+      - FuncExecuteAuthorization
+      - FuncCreateCert
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: lambda
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt FuncCheckTextRecord.Arn
+                  - !GetAtt FuncExecuteAuthorization.Arn
+                  - !GetAtt FuncCreateCert.Arn
+
+Outputs:
+  ApiGatewayUrl:
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/

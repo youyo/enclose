@@ -1,0 +1,105 @@
+swagger: '2.0'
+info:
+  title:
+    Ref: AWS::StackName
+host: 127.0.0.1:3000
+schemes:
+  - https
+  - http
+x-amazon-apigateway-request-validators:
+  all:
+    validateRequestBody: true
+    validateRequestParameters: true
+paths:
+  /:
+    post:
+      summary: Create certificate request
+      x-amazon-apigateway-request-validator: all
+      x-amazon-apigateway-integration:
+        httpMethod: POST
+        type: aws_proxy
+        uri:
+          Fn::Sub: arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FuncPostCertificateRequest.Arn}/invocations
+      parameters:
+        - name: Create certificate request parameter
+          in: body
+          required: true
+          schema:
+            type: object
+            properties:
+              domain:
+                type: string
+                minLength: 4
+              agree_tos:
+                type: boolean
+            required:
+              - domain
+              - agree_tos
+      responses:
+        201:
+          description: Create request successful.
+          schema:
+            type: object
+            properties:
+              client_key:
+                type: string
+              dns_record_key:
+                type: string
+              dns_record_value:
+                type: string
+              dns_record_type:
+                type: string
+            required:
+              - client_key
+              - dns_text_record_key
+              - dns_text_record_value
+              - dns_text_record_type
+        500:
+          description: Internal server error
+          schema:
+            type: object
+            properties:
+              message:
+                type: string
+            required:
+              - message
+  /{domain}:
+    get:
+      summary: Get domain status
+      x-amazon-apigateway-request-validator: all
+      x-amazon-apigateway-integration:
+        httpMethod: POST
+        type: aws_proxy
+        uri:
+          Fn::Sub: arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FuncGetDomainStatus.Arn}/invocations
+      parameters:
+        - name: domain
+          in: path
+          type: string
+          required: true
+      responses:
+        200:
+          description: Get domain status
+          schema:
+            type: object
+            properties:
+              domain:
+                type: string
+              status:
+                type: string
+              private_key_pem:
+                type: string
+              fullchain_pem:
+                type: string
+            required:
+              - domain
+              - status
+        500:
+          description: Internal server error
+          schema:
+            type: object
+            properties:
+              message:
+                type: string
+            required:
+              - message
